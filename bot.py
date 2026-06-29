@@ -1,13 +1,13 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 from aiohttp import web
 import psycopg2
 import uuid
 import os
 import asyncio
 
-# Render provides the PORT variable automatically.
-# DATABASE_URL and BOT_TOKEN will be set manually in the Render dashboard.
+# Render Variables
 PORT = int(os.environ.get("PORT", 8080))
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -15,69 +15,89 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # 1. Database Setup (PostgreSQL)
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
+# Updated Table: We now link the user_id directly to a generated license_key
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS licenses (
-        user_id TEXT, 
-        server_id TEXT, 
-        license_key TEXT,
-        PRIMARY KEY (user_id, server_id)
+        user_id TEXT PRIMARY KEY, 
+        license_key TEXT
     )
 ''')
 conn.commit()
 
 # 2. Discord Bot Setup
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+class LicenseBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=discord.Intents.default())
 
-@bot.command(name="assign")
-@commands.has_permissions(administrator=True)
-async def assign_license(ctx, member: discord.Member):
+    async def setup_hook(self):
+        # Syncs the slash commands to Discord when the bot starts
+        await self.tree.sync()
+        print("Slash commands synced successfully!")
+
+bot = LicenseBot()
+
+# 3. Slash Command for Key Generation
+@bot.tree.command(name="generate", description="Generates a unique license key for a user")
+@app_commands.describe(member="The user to assign the key to")
+@app_commands.default_permissions(administrator=True) # Only admins can run this
+async def generate_key(interaction: discord.Interaction, member: discord.Member):
     user_id = str(member.id)
-    server_id = str(ctx.guild.id)
-    license_key = str(uuid.uuid4())
+    license_key = str(uuid.uuid4()) # Generate random key (e.g., 550e8400-e29b-41d4-a716-446655440000)
 
     try:
+        # Insert or update the user's key in the database
         cursor.execute(
             """
-            INSERT INTO licenses (user_id, server_id, license_key) 
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id, server_id) 
+            INSERT INTO licenses (user_id, license_key) 
+            VALUES (%s, %s)
+            ON CONFLICT (user_id) 
             DO UPDATE SET license_key = EXCLUDED.license_key
             """, 
-            (user_id, server_id, license_key)
+            (user_id, license_key)
         )
         conn.commit()
-        await ctx.send(f"✅ Assigned license to {member.mention}.\nKey: `{license_key}`")
-    except Exception as e:
-        await ctx.send(f"❌ Error assigning license: {e}")
+        
+        # Respond ephemerally so only the admin sees the confirmation in the channel
+        await interaction.response.send_message(
+            f"✅ Generated license for {member.mention}.\n**Key:** `{license_key}`", 
+            ephemeral=True
+        )
+        
+        # Optionally DM the user their new key
+        try:
+            await member.send(f"Here is your loader access key: `{license_key}`\nEnter this along with your Discord ID.")
+        except:
+            pass # User might have DMs disabled
 
-# 3. Web API Setup
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Database error: {e}", ephemeral=True)
+
+
+# 4. Web API Setup for C++ Verification
 async def verify_license(request):
     user_id = request.query.get('user_id')
-    server_id = request.query.get('server_id')
+    license_key = request.query.get('license_key')
 
-    if not user_id or not server_id:
+    if not user_id or not license_key:
         return web.json_response({"status": "error", "message": "Missing parameters"}, status=400)
 
-    cursor.execute("SELECT license_key FROM licenses WHERE user_id=%s AND server_id=%s", (user_id, server_id))
+    # Check if the exact user_id and license_key combination exists
+    cursor.execute("SELECT license_key FROM licenses WHERE user_id=%s AND license_key=%s", (user_id, license_key))
     row = cursor.fetchone()
 
     if row:
-        return web.json_response({"status": "valid", "license_key": row[0]})
+        return web.json_response({"status": "valid"})
     else:
         return web.json_response({"status": "invalid"}, status=401)
 
 app = web.Application()
 app.router.add_get('/api/check', verify_license)
 
-# 4. Execution Engine
+# 5. Execution Engine
 @bot.event
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
     
-    # Bind to 0.0.0.0 and the dynamic port specified by Render
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
