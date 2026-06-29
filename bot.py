@@ -5,71 +5,71 @@ from aiohttp import web
 import psycopg2
 import uuid
 import os
-import asyncio
+import datetime
 
 # Render Variables
 PORT = int(os.environ.get("PORT", 8080))
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# 1. Database Setup (PostgreSQL)
+# 1. Database Setup
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
-# Updated Table: We now link the user_id directly to a generated license_key
+
+# Added 'expires_at' column to track duration
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS licenses (
         user_id TEXT PRIMARY KEY, 
-        license_key TEXT
+        license_key TEXT,
+        expires_at TIMESTAMP
     )
 ''')
 conn.commit()
 
-# 2. Discord Bot Setup
 class LicenseBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.default())
 
     async def setup_hook(self):
-        # Syncs the slash commands to Discord when the bot starts
+        # Change this if you want instant syncing to your specific server!
         await self.tree.sync()
         print("Slash commands synced successfully!")
 
 bot = LicenseBot()
 
-# 3. Slash Command for Key Generation
+# 3. Slash Command for Key Generation (Now with 'days' argument)
 @bot.tree.command(name="generate", description="Generates a unique license key for a user")
-@app_commands.describe(member="The user to assign the key to")
-@app_commands.default_permissions(administrator=True) # Only admins can run this
-async def generate_key(interaction: discord.Interaction, member: discord.Member):
+@app_commands.describe(member="The user to assign the key to", days="Duration in days (Use 0 for lifetime)")
+@app_commands.default_permissions(administrator=True)
+async def generate_key(interaction: discord.Interaction, member: discord.Member, days: int = 30):
     user_id = str(member.id)
-    license_key = str(uuid.uuid4()) # Generate random key (e.g., 550e8400-e29b-41d4-a716-446655440000)
+    license_key = str(uuid.uuid4())
+    
+    # Calculate expiration date
+    expires_at = None
+    if days > 0:
+        expires_at = datetime.datetime.utcnow() + datetime.timedelta(days=days)
 
     try:
-        # Insert or update the user's key in the database
         cursor.execute(
             """
-            INSERT INTO licenses (user_id, license_key) 
-            VALUES (%s, %s)
+            INSERT INTO licenses (user_id, license_key, expires_at) 
+            VALUES (%s, %s, %s)
             ON CONFLICT (user_id) 
-            DO UPDATE SET license_key = EXCLUDED.license_key
+            DO UPDATE SET license_key = EXCLUDED.license_key, expires_at = EXCLUDED.expires_at
             """, 
-            (user_id, license_key)
+            (user_id, license_key, expires_at)
         )
         conn.commit()
         
-        # Respond ephemerally so only the admin sees the confirmation in the channel
+        duration_text = f"{days} Days" if days > 0 else "Lifetime"
         await interaction.response.send_message(
-            f"✅ Generated license for {member.mention}.\n**Key:** `{license_key}`", 
+            f"✅ Generated {duration_text} license for {member.mention}.\n**Key:** `{license_key}`", 
             ephemeral=True
         )
-        
-        # Optionally DM the user their new key
-        try:
-            await member.send(f"Here is your loader access key: `{license_key}`\nEnter this along with your Discord ID.")
-        except:
-            pass # User might have DMs disabled
 
     except Exception as e:
+        conn.rollback() # Safe fallback
         await interaction.response.send_message(f"❌ Database error: {e}", ephemeral=True)
 
 
@@ -81,12 +81,16 @@ async def verify_license(request):
     if not user_id or not license_key:
         return web.json_response({"status": "error", "message": "Missing parameters"}, status=400)
 
-    # Check if the exact user_id and license_key combination exists
-    cursor.execute("SELECT license_key FROM licenses WHERE user_id=%s AND license_key=%s", (user_id, license_key))
+    cursor.execute("SELECT license_key, expires_at FROM licenses WHERE user_id=%s AND license_key=%s", (user_id, license_key))
     row = cursor.fetchone()
 
     if row:
-        return web.json_response({"status": "valid"})
+        expires_at = row[1]
+        # Check if the key has an expiration date AND if that date has passed
+        if expires_at and expires_at < datetime.datetime.utcnow():
+            return web.json_response({"status": "expired"})
+        else:
+            return web.json_response({"status": "valid"})
     else:
         return web.json_response({"status": "invalid"}, status=401)
 
@@ -97,7 +101,6 @@ app.router.add_get('/api/check', verify_license)
 @bot.event
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
-    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
